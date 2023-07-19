@@ -1,0 +1,379 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: CloudFormation Template to deploy an ETL orchestration pipeline by using
+  Redshift Data Api, Step Function and AWS Lambda
+Parameters:
+  RedshiftClusterEndpoint:
+    Description: Redshift cluster endpoint including port number and database name
+    Type: String
+    Default: redshift-cluster.xxxxxx.region.redshift.amazonaws.com:5439/dev
+  DbUsername:
+    Description: Redshift database user name which has access to run SQL Script.
+    Type: String
+    AllowedPattern: ([a-z])([a-z]|[0-9])*
+    Default: awsuser
+  ETLScriptS3Path:
+    Description: S3 bucket name (and folder if needed) to store your Stored Procedure
+      and validation SQL script files. Please note, this automation would grant full
+      access on your SQL script files' S3 bucket.
+    Type: String
+    Default: YourS3BucketName
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Input Parameters
+      Parameters:
+      - RedshiftClusterEndpoint
+      - DbUsername
+      - ETLScriptS3Path
+Mappings:
+  Script:
+    Config:
+      SetupScript: sp_statements.sql
+      ValidateScript: validate_sql_statement.sql
+Resources:
+  StateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM Role for the state machine in step function to run
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - Fn::Sub: states.${AWS::Region}.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: RedshiftBatchDataApiPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - redshift-data:BatchExecuteStatement
+            - redshift-data:ListStatements
+            - redshift-data:GetStatementResult
+            - redshift-data:DescribeStatement
+            - redshift-data:ExecuteStatement
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - redshift:GetClusterCredentials
+            Resource:
+            - Fn::Sub:
+              - arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:${SourceRedshiftClusterIdentifier}
+              - SourceRedshiftClusterIdentifier:
+                  Fn::Select:
+                  - 0
+                  - Fn::Split:
+                    - .
+                    - Ref: RedshiftClusterEndpoint
+            - Fn::Sub:
+              - arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbname:${SourceRedshiftClusterIdentifier}/${RedshiftDatabaseName}
+              - SourceRedshiftClusterIdentifier:
+                  Fn::Select:
+                  - 0
+                  - Fn::Split:
+                    - .
+                    - Ref: RedshiftClusterEndpoint
+                RedshiftDatabaseName:
+                  Fn::Select:
+                  - 1
+                  - Fn::Split:
+                    - /
+                    - Ref: RedshiftClusterEndpoint
+            - Fn::Sub:
+              - arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbuser:${SourceRedshiftClusterIdentifier}/${DbUsername}
+              - SourceRedshiftClusterIdentifier:
+                  Fn::Select:
+                  - 0
+                  - Fn::Split:
+                    - .
+                    - Ref: RedshiftClusterEndpoint
+      - PolicyName: ScriptS3AccessPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetBucketLocation
+            - s3:GetObject
+            - s3:ListBucket
+            Resource:
+            - Fn::Sub:
+              - arn:aws:s3:::${ETLScriptS3Bucket}/*
+              - ETLScriptS3Bucket:
+                  Fn::Select:
+                  - 0
+                  - Fn::Split:
+                    - /
+                    - Ref: ETLScriptS3Path
+            - Fn::Sub:
+              - arn:aws:s3:::${ETLScriptS3Bucket}
+              - ETLScriptS3Bucket:
+                  Fn::Select:
+                  - 0
+                  - Fn::Split:
+                    - /
+                    - Ref: ETLScriptS3Path
+  RedshiftETLStepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString:
+        Fn::Sub:
+        - "{\n  \"Comment\": \"A simple ETL workflow for loading dimension and fact\
+          \ tables\",\n  \"StartAt\": \"run_sales_data_pipeline\",\n  \"States\":\
+          \ {\n    \"run_sales_data_pipeline\": {\n      \"Comment\": \"Load 2 dimension\
+          \ tables\",\n      \"Type\": \"Parallel\",\n      \"ResultPath\": \"$.sql_output\"\
+          ,\n      \"Next\": \"read_sql_unload_statement\",\n      \"Branches\": [\n\
+          \        {\n          \"StartAt\": \"read_sql_unload_customer_statement\"\
+          ,\n          \"States\": {\n\n        \"read_sql_unload_customer_statement\"\
+          : {\n          \"Type\": \"Task\",\n          \"Parameters\": {\n      \
+          \      \"Bucket\": \"${S3BucketName}\",\n            \"Key\": \"unload_statement_customer.sql\"\
+          \n          },\n          \"ResultPath\": \"$.sql_output\",\n          \"\
+          ResultSelector\": {\n            \"sql_output.$\": \"$.Body\"\n        \
+          \  },\n          \"Resource\": \"arn:aws:states:::aws-sdk:s3:getObject\"\
+          ,\n          \"Next\": \"run_unload_customer_statement\"\n        },\n\n\
+          \n        \"run_unload_customer_statement\": {\n        \"Comment\": \"\
+          Unload customer table\",\n        \"Type\": \"Task\",\n        \"Resource\"\
+          : \"arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement\",\n   \
+          \     \"ResultPath\": \"$.sql_output\",\n        \"Parameters\": {\n   \
+          \     \"ClusterIdentifier\": \"${RedshiftClusterIdentifier}\",\n       \
+          \ \"Database\": \"${RedshiftDbName}\",\n        \"Sqls.$\": \"States.Array($.sql_output.sql_output)\"\
+          ,\n        \"DbUser\": \"${RedshiftDbUser}\"\n        },\n        \"Next\"\
+          : \"wait_on_unload_customer\"\n      },\n\n\n        \"wait_on_unload_customer\"\
+          : {\n          \"Comment\": \"Wait before status check\",\n          \"\
+          Type\": \"Wait\",\n          \"Seconds\": 5,\n          \"Next\": \"unload_customer_status_check\"\
+          \n        },\n\n\n            \"unload_customer_status_check\": {\n    \
+          \          \"Comment\": \"Check Task Status\",\n              \"Type\":\
+          \ \"Task\",\n              \"Resource\": \"arn:aws:states:::aws-sdk:redshiftdata:describeStatement\"\
+          ,\n              \"ResultPath\": \"$.sql_output\",\n              \"Parameters\"\
+          : {\n                \"Id.$\": \"$.sql_output.Id\"\n              },\n \
+          \             \"Next\": \"is_unload_customer_complete\"\n            },\n\
+          \n\n            \"is_unload_customer_complete\": {\n              \"Comment\"\
+          : \"check if load_item_table_complete step is complete\",\n            \
+          \  \"Type\": \"Choice\",\n              \"Choices\": [\n               \
+          \ {\n                  \"Variable\": \"$.sql_output.Status\",\n        \
+          \          \"StringEquals\": \"FAILED\",\n                  \"Next\": \"\
+          unload_customer_failed\"\n                },\n                {\n      \
+          \            \"Variable\": \"$.sql_output.Status\",\n                  \"\
+          StringEquals\": \"FINISHED\",\n                  \"Next\": \"unload_customer_success\"\
+          \n                }\n              ],\n              \"Default\": \"wait_on_unload_customer\"\
+          \n            },\n\n\n            \"unload_customer_success\": {\n     \
+          \         \"Type\": \"Pass\",\n              \"Result\": \"unload_customer_success\"\
+          ,\n              \"End\": true\n            },\n            \"unload_customer_failed\"\
+          : {\n              \"Type\": \"Fail\",\n              \"Cause\": \"Failure\
+          \ on unload customer\",\n              \"Error\": \"Error\"\n          \
+          \  }\n          }\n        },\n\n\n\n\n\n        {\n          \"StartAt\"\
+          : \"LoadCustomerAddressTable\",\n          \"States\": {\n            \"\
+          LoadCustomerAddressTable\": {\n              \"Comment\": \"Load Customer\
+          \ Address Table\",\n              \"Type\": \"Task\",\n              \"\
+          Resource\": \"arn:aws:states:::aws-sdk:redshiftdata:executeStatement\",\n\
+          \              \"ResultPath\": \"$.sql_output\",\n              \"Parameters\"\
+          : {\n                \"ClusterIdentifier\": \"${RedshiftClusterIdentifier}\"\
+          ,\n                \"Database\": \"${RedshiftDbName}\",\n              \
+          \  \"Sql\": \"call public.sp_load_dim_customer_address()\",\n          \
+          \      \"DbUser\": \"${RedshiftDbUser}\"\n              },\n           \
+          \   \"Next\": \"wait_on_load_customer_address_table\"\n            },\n\
+          \            \"wait_on_load_customer_address_table\": {\n              \"\
+          Comment\": \"Wait before status check\",\n              \"Type\": \"Wait\"\
+          ,\n              \"Seconds\": 5,\n              \"Next\": \"load_customer_address_table_status_check\"\
+          \n            },\n            \"load_customer_address_table_status_check\"\
+          : {\n              \"Comment\": \"Check Task Status\",\n              \"\
+          Type\": \"Task\",\n              \"Resource\": \"arn:aws:states:::aws-sdk:redshiftdata:describeStatement\"\
+          ,\n              \"ResultPath\": \"$.sql_output\",\n              \"Parameters\"\
+          : {\n                \"Id.$\": \"$.sql_output.Id\"\n              },\n \
+          \             \"Next\": \"is_load_customer_address_table_complete\"\n  \
+          \          },\n            \"is_load_customer_address_table_complete\":\
+          \ {\n              \"Comment\": \"check if load_customer_address_table step\
+          \ is complete\",\n              \"Type\": \"Choice\",\n              \"\
+          Choices\": [\n                {\n                  \"Variable\": \"$.sql_output.Status\"\
+          ,\n                  \"StringEquals\": \"FAILED\",\n                  \"\
+          Next\": \"load_customer_address_table_failed\"\n                },\n   \
+          \             {\n                  \"Variable\": \"$.sql_output.Status\"\
+          ,\n                  \"StringEquals\": \"FINISHED\",\n                 \
+          \ \"Next\": \"load_customer_address_table_success\"\n                }\n\
+          \              ],\n              \"Default\": \"wait_on_load_customer_address_table\"\
+          \n            },\n            \"load_customer_address_table_success\": {\n\
+          \              \"Type\": \"Pass\",\n              \"Result\": \"load_customer_address_table_success\"\
+          ,\n              \"End\": true\n            },\n            \"load_customer_address_table_failed\"\
+          : {\n              \"Type\": \"Fail\",\n              \"Cause\": \"Failure\
+          \ on load customer_address table\",\n              \"Error\": \"Error\"\n\
+          \            }\n          }\n        }\n      ]\n    },\n\n        \"read_sql_unload_statement\"\
+          : {\n          \"Type\": \"Task\",\n          \"Parameters\": {\n      \
+          \      \"Bucket\": \"${S3BucketName}\",\n            \"Key\": \"unload_statement.sql\"\
+          \n          },\n          \"ResultPath\": \"$.sql_output\",\n          \"\
+          ResultSelector\": {\n            \"sql_output.$\": \"$.Body\"\n        \
+          \  },\n          \"Resource\": \"arn:aws:states:::aws-sdk:s3:getObject\"\
+          ,\n          \"Next\": \"run_unload_statement\"\n        },\n    \n    \
+          \    \"run_unload_statement\": {\n        \"Comment\": \"Unload unload sales\
+          \ table\",\n        \"Type\": \"Task\",\n        \"Resource\": \"arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement\"\
+          ,\n        \"ResultPath\": \"$.sql_output\",\n        \"Parameters\": {\n\
+          \        \"ClusterIdentifier\": \"${RedshiftClusterIdentifier}\",\n    \
+          \    \"Database\": \"${RedshiftDbName}\",\n        \"Sqls.$\": \"States.Array($.sql_output.sql_output)\"\
+          ,\n        \"DbUser\": \"${RedshiftDbUser}\"\n        },\n        \"Next\"\
+          : \"run_load_fact_sales\"\n      },\n\n    \"run_load_fact_sales\": {\n\
+          \      \"Comment\": \"Load final fact table\",\n      \"Type\": \"Task\"\
+          ,\n      \"Resource\": \"arn:aws:states:::aws-sdk:redshiftdata:executeStatement\"\
+          ,\n      \"ResultPath\": \"$.sql_output\",\n      \"Parameters\": {\n  \
+          \      \"ClusterIdentifier\": \"${RedshiftClusterIdentifier}\",\n      \
+          \  \"Database\": \"${RedshiftDbName}\",\n        \"Sql\": \"call public.sp_load_fact_sales(trunc(sysdate))\"\
+          ,\n        \"DbUser\": \"${RedshiftDbUser}\"\n      },\n      \"Next\":\
+          \ \"wait_on_run_load_fact_sales_pipeline\"\n    },\n    \"wait_on_run_load_fact_sales_pipeline\"\
+          : {\n      \"Comment\": \"Wait before status check\",\n      \"Type\": \"\
+          Wait\",\n      \"Seconds\": 5,\n      \"Next\": \"run_load_fact_sales_status_check\"\
+          \n    },\n    \"run_load_fact_sales_status_check\": {\n      \"Comment\"\
+          : \"Check Task Status\",\n      \"Type\": \"Task\",\n      \"Resource\"\
+          : \"arn:aws:states:::aws-sdk:redshiftdata:describeStatement\",\n      \"\
+          ResultPath\": \"$.sql_output\",\n      \"Parameters\": {\n        \"Id.$\"\
+          : \"$.sql_output.Id\"\n      },\n      \"Next\": \"is_run_load_fact_sales_pipeline_complete\"\
+          \n    },\n    \"is_run_load_fact_sales_pipeline_complete\": {\n      \"\
+          Comment\": \"check if load_fact_sales step is complete\",\n      \"Type\"\
+          : \"Choice\",\n      \"Choices\": [\n        {\n          \"Variable\":\
+          \ \"$.sql_output.Status\",\n          \"StringEquals\": \"FAILED\",\n  \
+          \        \"Next\": \"sales_data_pipeline_failure\"\n        },\n       \
+          \ {\n          \"Variable\": \"$.sql_output.Status\",\n          \"StringEquals\"\
+          : \"FINISHED\",\n          \"Next\": \"read_validate_fact_sales_sql_statement\"\
+          \n        }\n      ],\n      \"Default\": \"wait_on_run_load_fact_sales_pipeline\"\
+          \n    },\n    \"sales_data_pipeline_failure\": {\n      \"Type\": \"Fail\"\
+          ,\n      \"Cause\": \"Failure on Sales Data Pipeline\",\n      \"Error\"\
+          : \"Error\"\n    },\n    \n    \"read_validate_fact_sales_sql_statement\"\
+          : {\n      \"Type\": \"Task\",\n      \"Parameters\": {\n        \"Bucket\"\
+          : \"${S3BucketName}\",\n        \"Key\": \"${ValidateScriptFilename}\"\n\
+          \      },\n      \"ResultPath\": \"$.sql_output\",\n      \"ResultSelector\"\
+          : {\n        \"sql_output.$\": \"$.Body\"\n      },\n      \"Resource\"\
+          : \"arn:aws:states:::aws-sdk:s3:getObject\",\n      \"Next\": \"run_validate_fact_sales\"\
+          \n    },\n    \"run_validate_fact_sales\": {\n      \"Comment\": \"Validate\
+          \ validate_fact_sales\",\n      \"Type\": \"Task\",\n      \"Resource\"\
+          : \"arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement\",\n   \
+          \   \"ResultPath\": \"$.sql_output\",\n      \"Parameters\": {\n       \
+          \ \"ClusterIdentifier\": \"${RedshiftClusterIdentifier}\",\n        \"Database\"\
+          : \"${RedshiftDbName}\",\n        \"Sqls.$\": \"States.Array($.sql_output.sql_output)\"\
+          ,\n        \"DbUser\": \"${RedshiftDbUser}\"\n      },\n      \"Next\":\
+          \ \"wait_on_run_validate_fact_sales\"\n    },\n    \"wait_on_run_validate_fact_sales\"\
+          : {\n      \"Comment\": \"Wait before status check\",\n      \"Type\": \"\
+          Wait\",\n      \"Seconds\": 5,\n      \"Next\": \"run_validate_fact_sales_status_check\"\
+          \n    },\n    \"run_validate_fact_sales_status_check\": {\n      \"Comment\"\
+          : \"Check Task Status\",\n      \"Type\": \"Task\",\n      \"Resource\"\
+          : \"arn:aws:states:::aws-sdk:redshiftdata:describeStatement\",\n      \"\
+          ResultPath\": \"$.sql_output\",\n      \"Parameters\": {\n        \"Id.$\"\
+          : \"$.sql_output.Id\"\n      },\n      \"Next\": \"is_validate_fact_sales_complete\"\
+          \n    },\n    \"is_validate_fact_sales_complete\": {\n      \"Comment\"\
+          : \"check if validate_fact_sales step is complete\",\n      \"Type\": \"\
+          Choice\",\n      \"Choices\": [\n        {\n          \"Variable\": \"$.sql_output.Status\"\
+          ,\n          \"StringEquals\": \"FAILED\",\n          \"Next\": \"sales_data_pipeline_failure\"\
+          \n        },\n        {\n          \"Variable\": \"$.sql_output.Status\"\
+          ,\n          \"StringEquals\": \"FINISHED\",\n          \"Next\": \"validate_fact_sales_complete\"\
+          \n        }\n      ],\n      \"Default\": \"wait_on_run_validate_fact_sales\"\
+          \n    },\n    \"validate_fact_sales_complete\": {\n      \"Type\": \"Pass\"\
+          ,\n      \"Result\": \"load_fact_sales_pipeline_success\",\n      \"End\"\
+          : true\n    }\n  }\n}"
+        - RedshiftClusterIdentifier:
+            Fn::Select:
+            - 0
+            - Fn::Split:
+              - .
+              - Ref: RedshiftClusterEndpoint
+          RedshiftDbName:
+            Fn::Select:
+            - 1
+            - Fn::Split:
+              - /
+              - Ref: RedshiftClusterEndpoint
+          RedshiftDbUser:
+            Ref: DbUsername
+          S3BucketName:
+            Ref: ETLScriptS3Path
+          SetupScriptFilename:
+            Fn::FindInMap:
+            - Script
+            - Config
+            - SetupScript
+          ValidateScriptFilename:
+            Fn::FindInMap:
+            - Script
+            - Config
+            - ValidateScript
+      RoleArn:
+        Fn::GetAtt:
+        - StateMachineExecutionRole
+        - Arn
+  LambdaInvokeStepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: LambdaInvokeStepFunctionRole-${AWS::AccountId}
+      Description: IAM Role for lambda to execute the Step Function
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: LambdaInvokePolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - states:StartExecution
+            Resource:
+              Ref: RedshiftETLStepFunction
+      - PolicyName: LambdaCloudFormationPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:*
+            Resource:
+            - Fn::Sub: arn:aws:s3:::cloudformation-custom-resource-response-${AWS::Region}
+            - Fn::Sub: arn:aws:s3:::cloudformation-waitcondition-${AWS::Region}
+            - Fn::Sub: arn:aws:s3:::cloudformation-custom-resource-response-${AWS::Region}/*
+            - Fn::Sub: arn:aws:s3:::cloudformation-waitcondition-${AWS::Region}/*
+  LambdaInvokeStepFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: LambdaInvokeStepFunction-${AWS::AccountId}
+      Description: Lambda to execute the step function
+      Handler: index.handler
+      Runtime: python3.8
+      Role:
+        Fn::GetAtt:
+        - LambdaInvokeStepFunctionRole
+        - Arn
+      Timeout: 60
+      Code:
+        ZipFile: "import boto3\nimport traceback\nimport json\nimport cfnresponse\n\
+          def handler(event, context):\n  print(event)\n  step_function_client = boto3.client('stepfunctions')\n\
+          \  res = {}\n  if event['RequestType'] != 'Delete':\n      try:\n      \
+          \    step_function_input = {\"comment\": \"Execute ETL Workflow for Redshift\"\
+          }\n          response = step_function_client.start_execution(stateMachineArn=event['ResourceProperties'].get('StepFunctionArn'),\n\
+          \                                                          input=json.dumps(step_function_input)\n\
+          \                                                         )\n          print(response)\n\
+          \      except:\n          print(traceback.format_exc())\n          cfnresponse.send(event,\
+          \ context, cfnresponse.FAILED, input)\n          raise\n  cfnresponse.send(event,\
+          \ context, cfnresponse.SUCCESS, res)\n"
+  StartStepFunction:
+    Type: Custom::LambdaStartStepFunction
+    Properties:
+      ServiceToken:
+        Fn::GetAtt:
+        - LambdaInvokeStepFunction
+        - Arn
+      StepFunctionArn:
+        Ref: RedshiftETLStepFunction
+Outputs:
+  RedshiftETLStepFunctionArn:
+    Description: The ARN of the step function used for ETL orchestration
+    Value:
+      Ref: RedshiftETLStepFunction

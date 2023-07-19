@@ -5,8 +5,8 @@
     "read_sp_statement": {
       "Type": "Task",
       "Parameters": {
-        "Bucket": "${S3BucketName}",
-        "Key": "${SetupScriptFilename}"
+        "Bucket": "somebucketwithaname",
+        "Key": "sp_statements.sql"
       },
       "ResultPath": "$.sql_output",
       "ResultSelector": {
@@ -21,10 +21,10 @@
       "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
       "ResultPath": "$.sql_output",
       "Parameters": {
-        "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-        "Database": "${RedshiftDbName}",
+        "ClusterIdentifier": "redshift-cluster-1",
+        "Database": "dev",
         "Sqls.$": "States.Array($.sql_output.sql_output)",
-        "DbUser": "${RedshiftDbUser}"
+        "DbUser": "awsuser"
       },
       "Next": "wait_on_sp_deploy_redshift"
     },
@@ -67,10 +67,10 @@
       "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
       "ResultPath": "$.sql_output",
       "Parameters": {
-        "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-        "Database": "${RedshiftDbName}",
+        "ClusterIdentifier": "redshift-cluster-1",
+        "Database": "dev",
         "Sql": "call public.sp_setup_sales_data_pipeline()",
-        "DbUser": "${RedshiftDbUser}"
+        "DbUser": "awsuser"
       },
       "Next": "wait_on_setup_sales_data_pipeline"
     },
@@ -111,7 +111,7 @@
       "Comment": "Load 2 dimension tables",
       "Type": "Parallel",
       "ResultPath": "$.sql_output",
-      "Next": "run_load_fact_sales",
+      "Next": "read_sql_unload_statement",
       "Branches": [
         {
           "StartAt": "LoadItemTable",
@@ -122,10 +122,10 @@
               "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
               "ResultPath": "$.sql_output",
               "Parameters": {
-                "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-                "Database": "${RedshiftDbName}",
+                "ClusterIdentifier": "redshift-cluster-1",
+                "Database": "dev",
                 "Sql": "call public.sp_load_dim_item()",
-                "DbUser": "${RedshiftDbUser}"
+                "DbUser": "awsuser"
               },
               "Next": "wait_on_load_item_table"
             },
@@ -183,10 +183,10 @@
               "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
               "ResultPath": "$.sql_output",
               "Parameters": {
-                "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-                "Database": "${RedshiftDbName}",
+                "ClusterIdentifier": "redshift-cluster-1",
+                "Database": "dev",
                 "Sql": "call public.sp_load_dim_customer_address()",
-                "DbUser": "${RedshiftDbUser}"
+                "DbUser": "awsuser"
               },
               "Next": "wait_on_load_customer_address_table"
             },
@@ -237,16 +237,42 @@
         }
       ]
     },
+    "read_sql_unload_statement": {
+      "Type": "Task",
+      "Parameters": {
+        "Bucket": "somebucketwithaname",
+        "Key": "unload_statement.sql"
+      },
+      "ResultPath": "$.sql_output",
+      "ResultSelector": {
+        "sql_output.$": "$.Body"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Next": "run_unload_statement"
+    },
+    "run_unload_statement": {
+      "Comment": "Unload unload sales table",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
+      "ResultPath": "$.sql_output",
+      "Parameters": {
+        "ClusterIdentifier": "redshift-cluster-1",
+        "Database": "dev",
+        "Sqls.$": "States.Array($.sql_output.sql_output)",
+        "DbUser": "awsuser"
+      },
+      "Next": "run_load_fact_sales"
+    },
     "run_load_fact_sales": {
       "Comment": "Load final fact table",
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
       "ResultPath": "$.sql_output",
       "Parameters": {
-        "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-        "Database": "${RedshiftDbName}",
+        "ClusterIdentifier": "redshift-cluster-1",
+        "Database": "dev",
         "Sql": "call public.sp_load_fact_sales(trunc(sysdate))",
-        "DbUser": "${RedshiftDbUser}"
+        "DbUser": "awsuser"
       },
       "Next": "wait_on_run_load_fact_sales_pipeline"
     },
@@ -291,8 +317,8 @@
     "read_validate_fact_sales_sql_statement": {
       "Type": "Task",
       "Parameters": {
-        "Bucket": "${S3BucketName}",
-        "Key": "${ValidateScriptFilename}"
+        "Bucket": "somebucketwithaname",
+        "Key": "validate_sql_statement.sql"
       },
       "ResultPath": "$.sql_output",
       "ResultSelector": {
@@ -307,10 +333,10 @@
       "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
       "ResultPath": "$.sql_output",
       "Parameters": {
-        "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-        "Database": "${RedshiftDbName}",
+        "ClusterIdentifier": "redshift-cluster-1",
+        "Database": "dev",
         "Sqls.$": "States.Array($.sql_output.sql_output)",
-        "DbUser": "${RedshiftDbUser}"
+        "DbUser": "awsuser"
       },
       "Next": "wait_on_run_validate_fact_sales"
     },
